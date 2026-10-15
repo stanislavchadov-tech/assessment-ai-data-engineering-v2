@@ -1,6 +1,6 @@
 """Load SMARD time series into the bronze layer (DuckDB) and expose a silver view."""
 
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
@@ -19,11 +19,12 @@ CREATE TABLE IF NOT EXISTS bronze_smard (
     filter_id   INTEGER   NOT NULL,
     region      VARCHAR   NOT NULL,
     resolution  VARCHAR   NOT NULL,
+    ts_utc      TIMESTAMPTZ NOT NULL,
     ts          TIMESTAMP NOT NULL,
     value       DOUBLE,
     chunk_ts    BIGINT    NOT NULL,
     ingested_at TIMESTAMP NOT NULL,
-    PRIMARY KEY (filter_id, region, resolution, ts)
+    PRIMARY KEY (filter_id, region, resolution, ts_utc)
 );
 
 CREATE TABLE IF NOT EXISTS ingest_watermark (
@@ -45,7 +46,7 @@ FROM bronze_smard
 WHERE resolution = 'hour' AND value IS NOT NULL;
 """
 
-Row = Tuple[int, str, str, datetime, float, int, datetime]
+Row = Tuple[int, str, str, datetime, datetime, float, int, datetime]
 
 
 def connect(path: Optional[str] = None) -> duckdb.DuckDBPyConnection:
@@ -59,7 +60,7 @@ def _local_midnight_ms(day: date) -> int:
 
 
 def _to_ts(ts_ms: int) -> datetime:
-    return datetime.fromtimestamp(ts_ms / 1000)
+    return datetime.fromtimestamp(ts_ms / 1000, tz=LOCAL_TZ)
 
 
 def _chunks_overlapping(index: Sequence[int], start_ms: int, end_ms: int) -> List[int]:
@@ -71,20 +72,23 @@ def _chunks_overlapping(index: Sequence[int], start_ms: int, end_ms: int) -> Lis
 def _fetch_rows(
     source: SmardSource, filter_id: int, region: str, resolution: str, chunks: Sequence[int]
 ) -> List[Row]:
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     rows: List[Row] = []
     for chunk_ts in chunks:
         for ts_ms, value in source.chunk(filter_id, region, resolution, chunk_ts):
             if value is None:
                 continue
-            rows.append((filter_id, region, resolution, _to_ts(ts_ms), value, chunk_ts, now))
+            aware = _to_ts(ts_ms)
+            ts_utc = aware.astimezone(timezone.utc)
+            ts = aware.replace(tzinfo=None)
+            rows.append((filter_id, region, resolution, ts_utc, ts, value, chunk_ts, now))
     return rows
 
 
 def _write(con: duckdb.DuckDBPyConnection, rows: Sequence[Row]) -> None:
     if rows:
         con.executemany(
-            "INSERT OR REPLACE INTO bronze_smard VALUES (?, ?, ?, ?, ?, ?, ?)", list(rows)
+            "INSERT OR REPLACE INTO bronze_smard VALUES (?, ?, ?, ?, ?, ?, ?, ?)", list(rows)
         )
 
 
@@ -114,15 +118,16 @@ def ingest_range(
         source.index(filter_id, region, resolution), _local_midnight_ms(start), _local_midnight_ms(end)
     )
     rows = _fetch_rows(source, filter_id, region, resolution, chunks)
+   
     con.execute("BEGIN")
     try:
-        # Replace what we hold for this series with the fresh pull.
-        con.execute(
-            "DELETE FROM bronze_smard WHERE filter_id = ? AND region = ? AND resolution = ?",
-            [filter_id, region, resolution],
-        )
-        _write(con, rows)
         if chunks:
+            placeholders = ",".join("?" * len(chunks))
+            con.execute(
+                f"DELETE FROM bronze_smard WHERE filter_id = ? AND region = ? AND resolution = ? AND chunk_ts IN ({placeholders})",                
+                [filter_id, region, resolution, *chunks],
+            )
+            _write(con, rows)
             _set_watermark(con, filter_id, region, resolution, max(chunks))
         con.execute("COMMIT")
     except Exception:
@@ -150,6 +155,7 @@ def ingest_incremental(
         [filter_id, region, resolution],
     ).fetchone()
     watermark = found[0] if found else None
+    
     index = source.index(filter_id, region, resolution)
     if watermark is None:
         if since is None:
@@ -158,10 +164,18 @@ def ingest_incremental(
             )
         chunks = _chunks_overlapping(index, _local_midnight_ms(since), 2**62)
     else:
-        chunks = [c for c in index if c > watermark]
+        chunks = [c for c in index if c >= watermark]
     rows = _fetch_rows(source, filter_id, region, resolution, chunks)
-    _write(con, rows)
-    if chunks:
-        _set_watermark(con, filter_id, region, resolution, max(chunks))
+
+    con.execute("BEGIN")
+    try:
+        _write(con, rows)
+        if chunks:
+            _set_watermark(con, filter_id, region, resolution, max(chunks))
+        con.execute("COMMIT")
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+    
     logger.info("incremental filter=%s chunks=%d rows=%d", filter_id, len(chunks), len(rows))
     return len(rows)

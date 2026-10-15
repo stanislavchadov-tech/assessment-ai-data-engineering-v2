@@ -16,3 +16,4 @@ data/
 *.duckdb.wal
 *.sqlite
 industrial_ml/.cache/
+*~
